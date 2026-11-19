@@ -16,8 +16,6 @@
     <properties>
         <revision>2.8</revision>
         <changelist>999999-SNAPSHOT</changelist>
-        <hpi.bundledArtifacts>org.eclipse.egit.github.core</hpi.bundledArtifacts>
-        <hpi.strictBundledArtifacts>true</hpi.strictBundledArtifacts>
         <!-- https://www.jenkins.io/doc/developer/plugin-development/choosing-jenkins-baseline/ -->
         <jenkins.baseline>2.516</jenkins.baseline>
         <jenkins.version>${jenkins.baseline}.3</jenkins.version>
@@ -97,11 +95,10 @@
             <artifactId>jackson2-api</artifactId>
         </dependency>
 
-        <!-- GitHub Client Dependencies -->
+        <!-- GitHub client: hub4j, from the github-api plugin (also what github-branch-source uses) -->
         <dependency>
-            <groupId>org.eclipse.mylyn.github</groupId>
-            <artifactId>org.eclipse.egit.github.core</artifactId>
-            <version>6.1.0.202203080745-r</version>
+            <groupId>org.jenkins-ci.plugins</groupId>
+            <artifactId>github-api</artifactId>
         </dependency>
 
         <dependency>
