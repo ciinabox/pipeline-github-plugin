@@ -9,7 +9,6 @@ import jenkins.scm.api.SCMHead;
 import jenkins.scm.api.SCMSource;
 import org.eclipse.egit.github.core.RepositoryId;
 import org.eclipse.egit.github.core.User;
-import org.eclipse.egit.github.core.service.CollaboratorService;
 import org.jenkinsci.plugins.github_branch_source.Connector;
 import org.jenkinsci.plugins.github_branch_source.GitHubSCMSource;
 import org.jenkinsci.plugins.github_branch_source.PullRequestSCMHead;
@@ -33,16 +32,17 @@ public class GitHubHelper {
         // go away
     }
 
-    public static Boolean isAuthorized(@NonNull final Job<?,?> job, @NonNull final String User) {
-        ExtendedGitHubClient client = getGitHubClient(job);
-        RepositoryId repository = getRepositoryId(job);
-        CollaboratorService collaboratorService = new CollaboratorService(client);
-
-        try {
-            return collaboratorService.isCollaborator(repository, User);
-        } catch (final IOException e) {
-            LOG.debug("Received an exception while trying to check if user {} is a collaborator of repository: {}",
-                    User, repository, e);
+    /**
+     * Whether {@code login} is a collaborator on the job's repository. GitHub answers 204 for a collaborator and
+     * 404 otherwise; hub4j's {@code GHRepository.isCollaborator} needs a {@code GHUser}, which costs another call.
+     */
+    public static Boolean isAuthorized(@NonNull final Job<?,?> job, @NonNull final String login) {
+        try (GitHubConnection connection = GitHubConnection.open(job)) {
+            connection.rest().get(connection.repoPath() + "/collaborators/" + login, GitHubRest.ACCEPT_JSON);
+            return true;
+        } catch (final IOException | RuntimeException e) {
+            LOG.debug("Received an exception while trying to check if user {} is a collaborator of job: {}",
+                    login, job.getFullName(), e);
             return false;
         }
     }

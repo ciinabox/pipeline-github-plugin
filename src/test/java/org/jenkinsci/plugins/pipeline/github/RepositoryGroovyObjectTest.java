@@ -48,7 +48,8 @@ public class RepositoryGroovyObjectTest {
         WorkflowJob job = r.createProject(WorkflowJob.class, "p");
         r.jenkins.getExtensionList(SCMSource.SourceByItem.class).add(new TestSourceByItemImpl(wireMockRule.port()));
 
-        stubFor(get(urlPathMatching("/api/v3/repos/owner/repo"))
+        GitHubApiStubs.stubApiRoot(wireMockRule.port());
+        stubFor(get(urlPathMatching("/repos/owner/repo"))
             .willReturn(aResponse()
                 .withStatus(200)
                 .withHeader("Content-Type", "application/json")

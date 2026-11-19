@@ -3,117 +3,109 @@ package org.jenkinsci.plugins.pipeline.github;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import groovy.lang.GroovyObjectSupport;
 import hudson.model.Job;
-import org.eclipse.egit.github.core.Repository;
-import org.eclipse.egit.github.core.RepositoryId;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedGitHubClient;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistIn;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistenceContext;
-import org.eclipse.egit.github.core.service.RepositoryService;
+import org.kohsuke.github.GHRepository;
 
 import java.io.Serializable;
+import java.net.URL;
 
 /**
  * Groovy object that represents a GitHub Repository.
+ *
+ * <p>Holds a snapshot of the repository taken when the object was created.
  */
 @PersistIn(PersistenceContext.NONE)
 public class RepositoryGroovyObject extends GroovyObjectSupport implements Serializable {
 
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
-    private final String jobId;
-    private Repository repository;
-
-    private transient Job job;
-    private transient ExtendedGitHubClient gitHubClient;
-    private transient RepositoryService repositoryService;
+    private final String name;
+    private final String owner;
+    private final String defaultBranch;
+    private final String description;
+    private final String htmlUrl;
+    private final String cloneUrl;
+    private final String sshUrl;
+    private final String gitUrl;
+    private final boolean isPrivate;
+    private final boolean fork;
+    private final long id;
 
     RepositoryGroovyObject(@NonNull final Job job) throws Exception {
-        this.job = job;
-        this.jobId = job.getFullName();
-
-        RepositoryId repositoryId = GitHubHelper.getRepositoryId(job);
-        if (repositoryId == null) {
-            throw new IllegalStateException("Job is not a GitHub job");
+        try (GitHubConnection connection = GitHubConnection.open(job)) {
+            GHRepository repository = connection.repository();
+            this.name = repository.getName();
+            this.owner = repository.getOwnerName();
+            this.defaultBranch = repository.getDefaultBranch();
+            this.description = repository.getDescription();
+            this.htmlUrl = toString(repository.getHtmlUrl());
+            this.cloneUrl = repository.getHttpTransportUrl();
+            this.sshUrl = repository.getSshUrl();
+            this.gitUrl = repository.getGitTransportUrl();
+            this.isPrivate = repository.isPrivate();
+            this.fork = repository.isFork();
+            this.id = repository.getId();
         }
-
-        this.repository = getRepositoryService().getRepository(repositoryId.getOwner(), repositoryId.getName());
     }
 
-    private Job getJob() {
-        if (job == null) {
-            job = GitHubHelper.getJob(jobId);
-        }
-        return job;
-    }
-
-    private ExtendedGitHubClient getGitHubClient() {
-        if (gitHubClient == null) {
-            gitHubClient = GitHubHelper.getGitHubClient(getJob());
-        }
-        return gitHubClient;
-    }
-
-    private RepositoryService getRepositoryService() {
-        if (repositoryService == null) {
-            repositoryService = new RepositoryService(getGitHubClient());
-        }
-        return repositoryService;
+    private static String toString(final URL url) {
+        return url == null ? null : url.toString();
     }
 
     @Whitelisted
     public String getName() {
-        return repository.getName();
+        return name;
     }
 
     @Whitelisted
     public String getOwner() {
-        return repository.getOwner().getLogin();
+        return owner;
     }
 
     @Whitelisted
     public String getDefaultBranch() {
-        return repository.getDefaultBranch();
+        return defaultBranch;
     }
 
     @Whitelisted
     public String getDescription() {
-        return repository.getDescription();
+        return description;
     }
 
     @Whitelisted
     public String getHtmlUrl() {
-        return repository.getHtmlUrl();
+        return htmlUrl;
     }
 
     @Whitelisted
     public String getCloneUrl() {
-        return repository.getCloneUrl();
+        return cloneUrl;
     }
 
     @Whitelisted
     public String getSshUrl() {
-        return repository.getSshUrl();
+        return sshUrl;
     }
 
     @Whitelisted
     public String getGitUrl() {
-        return repository.getGitUrl();
+        return gitUrl;
     }
 
     @Whitelisted
     public boolean isPrivate() {
-        return repository.isPrivate();
+        return isPrivate;
     }
 
     @Whitelisted
     public boolean isFork() {
-        return repository.isFork();
+        return fork;
     }
 
     @Whitelisted
     public long getId() {
-        return repository.getId();
+        return id;
     }
-
 }
