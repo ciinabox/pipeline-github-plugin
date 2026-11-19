@@ -185,7 +185,8 @@ final class GitHubRest {
         private final int status;
 
         GitHubRestException(final String method, final String path, final int status, final String body) {
-            super(String.format("%s %s: HTTP %d %s", method, path, status, message(body)));
+            // "<message> (<status>)" as egit's RequestException formatted it, then the request
+            super(String.format("%s (%d): %s %s", message(body), status, method, path));
             this.status = status;
         }
 

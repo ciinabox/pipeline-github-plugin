@@ -1,132 +1,174 @@
 package org.jenkinsci.plugins.pipeline.github;
 
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
+import com.fasterxml.jackson.databind.JsonNode;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import groovy.lang.GroovyObjectSupport;
-import org.eclipse.egit.github.core.Commit;
-import org.eclipse.egit.github.core.CommitStatus;
-import org.eclipse.egit.github.core.RepositoryCommit;
-import org.eclipse.egit.github.core.RepositoryId;
-import org.eclipse.egit.github.core.User;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedCommitComment;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedCommitService;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
+import org.kohsuke.github.GHCommitState;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
-import java.util.Collection;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 import static java.util.stream.Collectors.toList;
 
 /**
- * Groovy wrapper over a {@link RepositoryCommit}.
+ * Groovy wrapper over a commit of a pull request.
  *
- * Provides useful properties that allow one to iterate over a commits:
- * - Comments
- * - Files
- * - Statuses
- *
- * And a few methods to create:
- * - Review comments
- * - Statuses
+ * <p>Built from the pull request's commit list ({@code GET .../pulls/{n}/commits}), read through
+ * {@link GitHubRest} because hub4j's {@code GHPullRequestCommitDetail} drops the author and committer logins.
+ * That list has no stats or files, so the first call to {@link #getAdditions()}, {@link #getDeletions()},
+ * {@link #getTotalChanges()} or {@link #getFiles()} fetches the commit (the egit version threw a
+ * NullPointerException there).
  *
  * @author Aaron Whiteside
- * @see RepositoryCommit
  */
 public class CommitGroovyObject extends GroovyObjectSupport implements Serializable {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final String jobId;
-    private final RepositoryCommit commit;
-    private final RepositoryId base;
+    private final String sha;
+    private final String url;
+    private final String author;
+    private final String committer;
+    private final String message;
+    private final int commentCount;
+    private final List<String> parents;
 
-    private transient ExtendedCommitService commitService;
+    // Filled from GET .../commits/{sha} on first use.
+    private boolean detailed;
+    private int additions;
+    private int deletions;
+    private int totalChanges;
+    private ArrayList<CommitFileGroovyObject> files;
+
+    /** Credentials set by {@code pullRequest.setCredentials}; never persisted. */
+    @CheckForNull
+    @SuppressFBWarnings(value = "SE_TRANSIENT_FIELD_NOT_RESTORED",
+            justification = "Credentials must not be persisted; a resumed build uses the scan credentials")
+    private transient StandardUsernamePasswordCredentials credentials;
 
     CommitGroovyObject(final String jobId,
-                       final RepositoryCommit commit,
-                       final ExtendedCommitService commitService,
-                       final RepositoryId base) {
+                       final JsonNode commit,
+                       @CheckForNull final StandardUsernamePasswordCredentials credentials) {
+        Objects.requireNonNull(commit, "commit cannot be null");
         this.jobId = Objects.requireNonNull(jobId, "jobId cannot be null");
-        this.commit = Objects.requireNonNull(commit, "commit cannot be null");
-        this.commitService = Objects.requireNonNull(commitService, "commitService cannot be null");
-        this.base = Objects.requireNonNull(base, "base cannot be null");
+        this.credentials = credentials;
+        this.sha = GitHubRest.text(commit, "sha");
+        this.url = GitHubRest.text(commit, "url");
+        this.author = GitHubRest.login(commit, "author");
+        this.committer = GitHubRest.login(commit, "committer");
+        JsonNode gitCommit = commit.path("commit");
+        this.message = GitHubRest.text(gitCommit, "message");
+        this.commentCount = (int) GitHubRest.number(gitCommit, "comment_count");
+        List<String> parentShas = new ArrayList<>();
+        commit.path("parents").forEach(p -> parentShas.add(GitHubRest.text(p, "sha")));
+        this.parents = parentShas;
+        if (commit.has("stats") || commit.has("files")) {
+            detail(commit);
+        }
     }
 
-    private ExtendedCommitService getCommitService() {
-        if (commitService == null) {
-            commitService = new ExtendedCommitService(GitHubHelper.getGitHubClient(GitHubHelper.getJob(jobId)));
+    private GitHubConnection connect() throws IOException {
+        return GitHubConnection.open(GitHubHelper.getJob(jobId), credentials);
+    }
+
+    private void detail(final JsonNode commit) {
+        JsonNode stats = commit.path("stats");
+        this.additions = (int) GitHubRest.number(stats, "additions");
+        this.deletions = (int) GitHubRest.number(stats, "deletions");
+        this.totalChanges = (int) GitHubRest.number(stats, "total");
+        ArrayList<CommitFileGroovyObject> commitFiles = new ArrayList<>();
+        commit.path("files").forEach(f -> commitFiles.add(new CommitFileGroovyObject(f)));
+        this.files = commitFiles;
+        this.detailed = true;
+    }
+
+    private synchronized void ensureDetailed() {
+        if (detailed) {
+            return;
         }
-        return commitService;
+        try (GitHubConnection connection = connect()) {
+            detail(connection.rest().get(connection.repoPath() + "/commits/" + sha, GitHubRest.ACCEPT_JSON));
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Whitelisted
     public String getSha() {
-        return commit.getSha();
+        return sha;
     }
 
     @Whitelisted
     public String getUrl() {
-        return commit.getUrl();
+        return url;
     }
 
     @Whitelisted
     public String getAuthor() {
-        return Optional.ofNullable(commit.getAuthor())
-                .map(User::getLogin)
-                .orElse(null);
+        return author;
     }
 
     @Whitelisted
     public String getCommitter() {
-        return Optional.ofNullable(commit.getCommitter())
-                .map(User::getLogin)
-                .orElse(null);
+        return committer;
     }
 
     @Whitelisted
     public String getMessage() {
-        return commit.getCommit().getMessage();
+        return message;
     }
 
     @Whitelisted
     public int getCommentCount() {
-        return commit.getCommit().getCommentCount();
+        return commentCount;
     }
 
     @Whitelisted
     public int getAdditions() {
-        return commit.getStats().getAdditions();
+        ensureDetailed();
+        return additions;
     }
 
     @Whitelisted
     public int getDeletions() {
-        return commit.getStats().getDeletions();
+        ensureDetailed();
+        return deletions;
     }
 
     @Whitelisted
     public int getTotalChanges() {
-        return commit.getStats().getTotal();
+        ensureDetailed();
+        return totalChanges;
     }
 
     @Whitelisted
     public Iterable<ReviewCommentGroovyObject> getComments() {
-        Stream<ReviewCommentGroovyObject> stream = StreamSupport.stream(
-                getCommitService().pageComments2(base, commit.getSha()).spliterator(), false)
-                .flatMap(Collection::stream)
-                .map(c -> new ReviewCommentGroovyObject(jobId, base, c, commitService));
-        return stream::iterator;
+        try (GitHubConnection connection = connect()) {
+            return connection.rest()
+                    .getAll(connection.repoPath() + "/commits/" + sha + "/comments", GitHubRest.ACCEPT_JSON)
+                    .stream()
+                    .map(c -> new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.COMMIT, c,
+                            credentials))
+                    .collect(toList());
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Whitelisted
     public Iterable<CommitStatusGroovyObject> getStatuses() {
-        try {
-            return getCommitService().getStatuses(base, commit.getSha())
+        try (GitHubConnection connection = connect()) {
+            return connection.repository().listCommitStatuses(sha).toList()
                     .stream()
                     .map(CommitStatusGroovyObject::new)
                     .collect(toList());
@@ -137,28 +179,21 @@ public class CommitGroovyObject extends GroovyObjectSupport implements Serializa
 
     @Whitelisted
     public Iterable<String> getParents() {
-        return commit.getParents()
-                .stream()
-                .map(Commit::getSha)
-                .collect(toList());
+        return new ArrayList<>(parents);
     }
 
     @Whitelisted
     public Iterable<CommitFileGroovyObject> getFiles() {
-        return Optional.ofNullable(commit.getFiles())
-                .orElseGet(Collections::emptyList)
-                .stream()
-                .map(CommitFileGroovyObject::new)
-                .collect(toList());
+        ensureDetailed();
+        return new ArrayList<>(files);
     }
 
     @Whitelisted
     public ReviewCommentGroovyObject comment(final Map<String, Object> params) {
         Objects.requireNonNull(params.get("body"), "body is a required argument");
-
         return comment(params.get("body").toString(),
                        params.get("path") != null ? params.get("path").toString() : null,
-                       (Integer)params.get("position"));
+                       (Integer) params.get("position"));
     }
 
     @Whitelisted
@@ -166,17 +201,18 @@ public class CommitGroovyObject extends GroovyObjectSupport implements Serializa
                                              final String path,
                                              final Integer position) {
         Objects.requireNonNull(body, "body is a required argument");
-
-        ExtendedCommitComment comment = new ExtendedCommitComment();
-        comment.setBody(body);
-        comment.setPath(path);
-        comment.setPosition(position);
-        try {
-            return new ReviewCommentGroovyObject(
-                    jobId,
-                    base,
-                    getCommitService().addComment(base, commit.getSha(), comment),
-                    getCommitService());
+        Map<String, Object> request = new HashMap<>();
+        request.put("body", body);
+        if (path != null) {
+            request.put("path", path);
+        }
+        if (position != null) {
+            request.put("position", position);
+        }
+        try (GitHubConnection connection = connect()) {
+            JsonNode created = connection.rest().post(connection.repoPath() + "/commits/" + sha + "/comments",
+                    request, GitHubRest.ACCEPT_JSON);
+            return new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.COMMIT, created, credentials);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -185,7 +221,6 @@ public class CommitGroovyObject extends GroovyObjectSupport implements Serializa
     @Whitelisted
     public CommitStatusGroovyObject createStatus(final Map<String, Object> params) {
         Objects.requireNonNull(params.get("status"), "status is a required argument");
-
         return createStatus(params.get("status").toString(),
                             params.get("context") != null ? params.get("context").toString() : null,
                             params.get("description") != null ? params.get("description").toString() : null,
@@ -198,17 +233,27 @@ public class CommitGroovyObject extends GroovyObjectSupport implements Serializa
                                                  final String description,
                                                  final String targetUrl) {
         Objects.requireNonNull(status, "status is a required argument");
-
-        CommitStatus commitStatus = new CommitStatus();
-        commitStatus.setState(status);
-        commitStatus.setContext(context);
-        commitStatus.setDescription(description);
-        commitStatus.setTargetUrl(targetUrl);
-        try {
-            return new CommitStatusGroovyObject(
-                    getCommitService().createStatus(base, commit.getSha(), commitStatus));
+        try (GitHubConnection connection = connect()) {
+            return createStatus(connection, sha, status, context, description, targetUrl);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    static CommitStatusGroovyObject createStatus(final GitHubConnection connection,
+                                                 final String sha,
+                                                 final String status,
+                                                 final String context,
+                                                 final String description,
+                                                 final String targetUrl) throws IOException {
+        GHCommitState state;
+        try {
+            state = GHCommitState.valueOf(status.toUpperCase(Locale.ROOT));
+        } catch (final IllegalArgumentException e) {
+            throw new IllegalArgumentException(
+                    "status must be one of error, failure, pending, success; was " + status, e);
+        }
+        return new CommitStatusGroovyObject(
+                connection.repository().createCommitStatus(sha, state, targetUrl, description, context));
     }
 }

@@ -1,89 +1,113 @@
 package org.jenkinsci.plugins.pipeline.github;
 
 import groovy.lang.GroovyObjectSupport;
-import org.eclipse.egit.github.core.Milestone;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedMilestone;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
+import org.kohsuke.github.GHMilestone;
 
 import java.io.Serializable;
 import java.util.Date;
 import java.util.Objects;
 
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.copy;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.login;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.lower;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.unchecked;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.url;
+
 /**
- * Groovy wrapper over {@link Milestone}
+ * Groovy wrapper over a milestone.
  *
  * @author Aaron Whiteside
- * @see Milestone
  */
 public class MilestoneGroovyObject extends GroovyObjectSupport implements Serializable {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
-    private final String jobId;
-    private final ExtendedMilestone milestone;
+    private final Date createdAt;
+    private final Date dueOn;
+    private final int closedIssues;
+    private final int number;
+    private final int openIssues;
+    private final String description;
+    private final String state;
+    private final String title;
+    private final String url;
+    private final String creator;
+    private final Date updatedAt;
+    private final Date closedAt;
 
-    MilestoneGroovyObject(final String jobId, final ExtendedMilestone milestone) {
-        this.jobId = Objects.requireNonNull(jobId, "jobId cannot be null");
-        this.milestone = Objects.requireNonNull(milestone, "milestone cannot be null");
+    MilestoneGroovyObject(final GHMilestone milestone) {
+        Objects.requireNonNull(milestone, "milestone cannot be null");
+        this.createdAt = unchecked(milestone::getCreatedAt);
+        this.dueOn = milestone.getDueOn();
+        this.closedIssues = milestone.getClosedIssues();
+        this.number = milestone.getNumber();
+        this.openIssues = milestone.getOpenIssues();
+        this.description = milestone.getDescription();
+        this.state = lower(milestone.getState());
+        this.title = milestone.getTitle();
+        this.url = url(milestone.getUrl());
+        this.creator = unchecked(() -> login(milestone.getCreator()));
+        this.updatedAt = unchecked(milestone::getUpdatedAt);
+        this.closedAt = unchecked(milestone::getClosedAt);
     }
 
     @Whitelisted
     public Date getCreatedAt() {
-        return milestone.getCreatedAt();
+        return copy(createdAt);
     }
 
     @Whitelisted
     public Date getDueOn() {
-        return milestone.getDueOn();
+        return copy(dueOn);
     }
 
     @Whitelisted
     public int getClosedIssues() {
-        return milestone.getClosedIssues();
+        return closedIssues;
     }
 
     @Whitelisted
     public int getNumber() {
-        return milestone.getNumber();
+        return number;
     }
 
     @Whitelisted
     public int getOpenIssues() {
-        return milestone.getOpenIssues();
+        return openIssues;
     }
 
     @Whitelisted
     public String getDescription() {
-        return milestone.getDescription();
+        return description;
     }
 
     @Whitelisted
     public String getState() {
-        return milestone.getState();
+        return state;
     }
 
     @Whitelisted
     public String getTitle() {
-        return milestone.getTitle();
+        return title;
     }
 
     @Whitelisted
     public String getUrl() {
-        return milestone.getUrl();
+        return url;
     }
 
     @Whitelisted
     public String getCreator() {
-        return milestone.getCreator().getLogin();
+        return creator;
     }
 
     @Whitelisted
     public Date getUpdatedAt() {
-        return milestone.getUpdatedAt();
+        return copy(updatedAt);
     }
 
     @Whitelisted
     public Date getClosedAt() {
-        return milestone.getClosedAt();
+        return copy(closedAt);
     }
-
 }

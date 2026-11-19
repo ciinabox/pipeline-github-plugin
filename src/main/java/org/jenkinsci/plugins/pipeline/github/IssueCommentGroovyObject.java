@@ -1,99 +1,125 @@
 package org.jenkinsci.plugins.pipeline.github;
 
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
+import com.fasterxml.jackson.databind.JsonNode;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import groovy.lang.GroovyObjectSupport;
-import org.eclipse.egit.github.core.Comment;
-import org.eclipse.egit.github.core.RepositoryId;
-import org.eclipse.egit.github.core.service.IssueService;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Objects;
 
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.copy;
+
 /**
- * Groovy wrapper over a {@link Comment}
+ * Groovy wrapper over an issue (pull request conversation) comment.
  *
- * Additionally provides one the ability to update the comment body and delete the comment.
+ * <p>Comments are read and written through {@link GitHubRest} with the {@code full+json} media type, so
+ * {@link #getBodyHtml()} and {@link #getBodyText()} stay populated; hub4j's {@code GHIssueComment} has neither, and
+ * no way to edit or delete a comment by id.
  *
  * @author Aaron Whiteside
- * @see Comment
  */
 public class IssueCommentGroovyObject extends GroovyObjectSupport implements Serializable {
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final String jobId;
-    private final RepositoryId base;
-    private Comment comment;
+    private final long id;
+    private Date createdAt;
+    private Date updatedAt;
+    private String body;
+    private String bodyHtml;
+    private String bodyText;
+    private String url;
+    private String user;
 
-    private transient IssueService issueService;
+    /** Credentials set by {@code pullRequest.setCredentials}; never persisted. */
+    @CheckForNull
+    @SuppressFBWarnings(value = "SE_TRANSIENT_FIELD_NOT_RESTORED",
+            justification = "Credentials must not be persisted; a resumed build uses the scan credentials")
+    private transient StandardUsernamePasswordCredentials credentials;
 
     IssueCommentGroovyObject(final String jobId,
-                             final Comment comment,
-                             final RepositoryId base,
-                             final IssueService issueService) {
+                             final JsonNode comment,
+                             @CheckForNull final StandardUsernamePasswordCredentials credentials) {
+        Objects.requireNonNull(comment, "comment cannot be null");
         this.jobId = Objects.requireNonNull(jobId, "jobId cannot be null");
-        this.comment = Objects.requireNonNull(comment, "comment cannot be null");
-        this.base = Objects.requireNonNull(base, "base cannot be null");
-        this.issueService = Objects.requireNonNull(issueService, "issueService cannot be null");
+        this.id = GitHubRest.number(comment, "id");
+        this.credentials = credentials;
+        update(comment);
     }
 
-    private IssueService getIssueService() {
-        if (issueService == null) {
-            issueService = new IssueService(GitHubHelper.getGitHubClient(GitHubHelper.getJob(jobId)));
-        }
-        return issueService;
+    private void update(final JsonNode comment) {
+        this.createdAt = GitHubRest.date(comment, "created_at");
+        this.updatedAt = GitHubRest.date(comment, "updated_at");
+        this.body = GitHubRest.text(comment, "body");
+        this.bodyHtml = GitHubRest.text(comment, "body_html");
+        this.bodyText = GitHubRest.text(comment, "body_text");
+        this.url = GitHubRest.text(comment, "url");
+        this.user = GitHubRest.login(comment, "user");
+    }
+
+    /** {@code PATCH /repos/{owner}/{repo}/issues/comments/{id}}. */
+    static JsonNode edit(final GitHubConnection connection, final long id, final String body) throws IOException {
+        return connection.rest().patch(connection.repoPath() + "/issues/comments/" + id,
+                Collections.singletonMap("body", body), GitHubRest.ACCEPT_FULL_JSON);
+    }
+
+    /** {@code DELETE /repos/{owner}/{repo}/issues/comments/{id}}. */
+    static void delete(final GitHubConnection connection, final long id) throws IOException {
+        connection.rest().delete(connection.repoPath() + "/issues/comments/" + id, null);
     }
 
     @Whitelisted
     public Date getCreatedAt() {
-        return comment.getCreatedAt();
+        return copy(createdAt);
     }
 
     @Whitelisted
     public Date getUpdatedAt() {
-        return comment.getUpdatedAt();
+        return copy(updatedAt);
     }
 
     @Whitelisted
     public String getBody() {
-        return comment.getBody();
+        return body;
     }
 
     @Whitelisted
     public String getBodyHtml() {
-        return comment.getBodyHtml();
+        return bodyHtml;
     }
 
     @Whitelisted
     public String getBodyText() {
-        return comment.getBodyText();
+        return bodyText;
     }
 
     @Whitelisted
     public long getId() {
-        return comment.getId();
+        return id;
     }
 
     @Whitelisted
     public String getUrl() {
-        return comment.getUrl();
+        return url;
     }
 
     @Whitelisted
     public String getUser() {
-        return GitHubHelper.userToLogin(comment.getUser());
+        return user;
     }
 
     @Whitelisted
     public void setBody(final String body) {
-        Comment edit = new Comment();
-        edit.setId(comment.getId());
-        edit.setBody(body);
-        try {
-            comment = getIssueService().editComment(base, edit);
+        Objects.requireNonNull(body, "body cannot be null");
+        try (GitHubConnection connection = GitHubConnection.open(GitHubHelper.getJob(jobId), credentials)) {
+            update(edit(connection, id, body));
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -101,8 +127,8 @@ public class IssueCommentGroovyObject extends GroovyObjectSupport implements Ser
 
     @Whitelisted
     public void delete() {
-        try {
-            getIssueService().deleteComment(base, comment.getId());
+        try (GitHubConnection connection = GitHubConnection.open(GitHubHelper.getJob(jobId), credentials)) {
+            delete(connection, id);
         } catch (final IOException e) {
             throw new UncheckedIOException(e);
         }

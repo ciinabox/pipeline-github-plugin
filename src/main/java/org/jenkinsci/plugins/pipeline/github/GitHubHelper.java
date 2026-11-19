@@ -47,6 +47,8 @@ public class GitHubHelper {
         }
     }
 
+    /** @deprecated egit is no longer published; use hub4j/github-api. Removed with the egit dependency. */
+    @Deprecated
     public static ExtendedGitHubClient getGitHubClient(@NonNull final Job<?,?> job) {
         SCMSource scmSource = SCMSource.SourceByItem.findSource(job);
         if (scmSource instanceof GitHubSCMSource) {
@@ -72,6 +74,8 @@ public class GitHubHelper {
         throw new IllegalArgumentException("Job's SCM is not GitHub.");
     }
 
+    /** @deprecated egit is no longer published; use hub4j/github-api. Removed with the egit dependency. */
+    @Deprecated
     public static RepositoryId getRepositoryId(@NonNull final Job<?,?> job) {
         SCMSource src = SCMSource.SourceByItem.findSource(job);
         if (src instanceof GitHubSCMSource) {
@@ -89,6 +93,8 @@ public class GitHubHelper {
         return head;
     }
 
+    /** @deprecated egit is no longer published; use hub4j/github-api. Removed with the egit dependency. */
+    @Deprecated
     public static String userToLogin(final User user) {
         return user == null ? null : user.getLogin();
     }
