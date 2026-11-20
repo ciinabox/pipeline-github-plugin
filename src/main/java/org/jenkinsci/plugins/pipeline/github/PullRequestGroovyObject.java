@@ -1,507 +1,556 @@
 package org.jenkinsci.plugins.pipeline.github;
 
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
+import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
+import com.fasterxml.jackson.databind.JsonNode;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import groovy.lang.GroovyObjectSupport;
 import hudson.model.Job;
-import org.eclipse.egit.github.core.Comment;
-import org.eclipse.egit.github.core.CommitStatus;
-import org.eclipse.egit.github.core.Label;
-import org.eclipse.egit.github.core.Milestone;
-import org.eclipse.egit.github.core.PullRequestMarker;
-import org.eclipse.egit.github.core.RepositoryId;
-import org.eclipse.egit.github.core.Team;
-import org.eclipse.egit.github.core.User;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedCommitComment;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedCommitService;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedGitHubClient;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedIssueService;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedMergeStatus;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedMilestoneService;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedPullRequest;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedPullRequestService;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistIn;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistenceContext;
+import org.kohsuke.github.GHIssueState;
+import org.kohsuke.github.GHLabel;
+import org.kohsuke.github.GHPullRequest;
+import org.kohsuke.github.GHPullRequestReviewBuilder;
+import org.kohsuke.github.GHPullRequestReviewEvent;
+import org.kohsuke.github.GHTeam;
+import org.kohsuke.github.GHUser;
 
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
-import java.util.Collection;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
+import java.util.UUID;
 
 import static java.util.stream.Collectors.toList;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.copy;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.login;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.lower;
+import static org.jenkinsci.plugins.pipeline.github.Snapshots.url;
 
 /**
  * Groovy object that represents a GitHub PullRequest.
  *
- * TODO: better javadoc
+ * <p>Holds a serialisable snapshot of the pull request, taken when the object is created and after every change
+ * made through it (or {@link #refresh()}). Collections such as reviews, labels and comments are read from GitHub
+ * on each call. Calls go through hub4j (via {@link GitHubConnection}) where it has an API, and through
+ * {@link GitHubRest} for the endpoints it lacks.
  *
  * @author Aaron Whiteside
- * @see ExtendedPullRequest
  */
 @PersistIn(PersistenceContext.NONE)
 public class PullRequestGroovyObject extends GroovyObjectSupport implements Serializable {
 
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final String jobId;
     private int pullRequestNumber;
-    private RepositoryId base;
-    private ExtendedPullRequest pullRequest;
 
-    private transient Job job;
-    private transient ExtendedGitHubClient gitHubClient;
-    private transient ExtendedPullRequestService pullRequestService;
-    private transient ExtendedIssueService issueService;
-    private transient ExtendedCommitService commitService;
-    private transient ExtendedMilestoneService milestoneService;
+    // snapshot
+    private long id;
+    private String diffUrl;
+    private String url;
+    private String patchUrl;
+    private String state;
+    private String issueUrl;
+    private String title;
+    private String body;
+    private boolean locked;
+    private boolean draft;
+    private MilestoneGroovyObject milestone;
+    private String headSha;
+    private String headRef;
+    private String baseSha;
+    private String baseRef;
+    private Date updatedAt;
+    private Date createdAt;
+    private String createdBy;
+    private Date closedAt;
+    private String closedBy;
+    private Date mergedAt;
+    private String mergedBy;
+    private int commitCount;
+    private int commentCount;
+    private int deletions;
+    private String mergeCommitSha;
+    private String mergeableState;
+    private boolean maintainerCanModify;
+    private int additions;
+    private int changedFiles;
+    private boolean mergeable;
+    private boolean merged;
+    private ArrayList<String> assignees = new ArrayList<>();
 
-    PullRequestGroovyObject(@NonNull final Job job) throws Exception {
+    private transient Job<?, ?> job;
+    /** Credentials set by {@link #setCredentials}; never persisted, so lost if the build resumes. */
+    @CheckForNull
+    private transient StandardUsernamePasswordCredentials credentials;
+
+    PullRequestGroovyObject(@NonNull final Job<?, ?> job) throws Exception {
         this.job = job;
-
         this.jobId = job.getFullName();
-
         this.pullRequestNumber = GitHubHelper.getPullRequest(job).getNumber();
-        this.base = GitHubHelper.getRepositoryId(job);
-
-        // fetch and cache the pull request
-        this.pullRequest = getPullRequestService().getPullRequest(base, pullRequestNumber);
-    }
-
-    PullRequestGroovyObject(@NonNull final Job job, final ExtendedPullRequest pr) throws Exception {
-        this.job = job;
-
-        this.jobId = job.getFullName();
-
-        if (null != pr) {
-            this.pullRequestNumber = pr.getNumber();
-            this.base = GitHubHelper.getRepositoryId(job);
-            this.pullRequest = pr;
+        try (GitHubConnection connection = connect()) {
+            snapshot(connection.repository().getPullRequest(pullRequestNumber));
         }
     }
 
-    private Job getJob() {
+    /** For a pull request already fetched; {@code pr} may be null (no merged pull request found). */
+    PullRequestGroovyObject(@NonNull final Job<?, ?> job, @CheckForNull final GHPullRequest pr) throws Exception {
+        this.job = job;
+        this.jobId = job.getFullName();
+        if (pr != null) {
+            this.pullRequestNumber = pr.getNumber();
+            snapshot(pr);
+        }
+    }
+
+    private Job<?, ?> getJob() {
         if (job == null) {
             job = GitHubHelper.getJob(jobId);
         }
         return job;
     }
 
-    private ExtendedGitHubClient getGitHubClient() {
-        if (gitHubClient == null) {
-            gitHubClient = GitHubHelper.getGitHubClient(getJob());
-        }
-        return gitHubClient;
+    private GitHubConnection connect() throws IOException {
+        return GitHubConnection.open(getJob(), credentials);
     }
 
-    private ExtendedPullRequestService getPullRequestService() {
-        if (pullRequestService == null) {
-            pullRequestService = new ExtendedPullRequestService(getGitHubClient());
-        }
-        return pullRequestService;
+    private GHPullRequest fetch(final GitHubConnection connection) throws IOException {
+        return connection.repository().getPullRequest(pullRequestNumber);
     }
 
-    private ExtendedIssueService getIssueService() {
-        if (issueService == null) {
-            issueService = new ExtendedIssueService(getGitHubClient());
-        }
-        return issueService;
+    private String pullPath(final GitHubConnection connection) {
+        return connection.repoPath() + "/pulls/" + pullRequestNumber;
     }
 
-    private ExtendedCommitService getCommitService() {
-        if (commitService == null) {
-            commitService = new ExtendedCommitService(getGitHubClient());
-        }
-        return commitService;
+    private String issuePath(final GitHubConnection connection) {
+        return connection.repoPath() + "/issues/" + pullRequestNumber;
     }
 
-    private ExtendedMilestoneService getMilestoneService() {
-        if (milestoneService == null) {
-            milestoneService = new ExtendedMilestoneService(getGitHubClient());
-        }
-        return milestoneService;
+    private void snapshot(final GHPullRequest pr) throws IOException {
+        this.id = pr.getId();
+        this.pullRequestNumber = pr.getNumber();
+        this.diffUrl = url(pr.getDiffUrl());
+        this.url = url(pr.getHtmlUrl());
+        this.patchUrl = url(pr.getPatchUrl());
+        this.state = lower(pr.getState());
+        this.issueUrl = url(pr.getIssueUrl());
+        this.title = pr.getTitle();
+        this.body = pr.getBody();
+        this.locked = pr.isLocked();
+        this.draft = pr.isDraft();
+        this.milestone = pr.getMilestone() == null ? null : new MilestoneGroovyObject(pr.getMilestone());
+        this.headSha = pr.getHead() == null ? null : pr.getHead().getSha();
+        this.headRef = pr.getHead() == null ? null : pr.getHead().getRef();
+        this.baseSha = pr.getBase() == null ? null : pr.getBase().getSha();
+        this.baseRef = pr.getBase() == null ? null : pr.getBase().getRef();
+        this.updatedAt = pr.getUpdatedAt();
+        this.createdAt = pr.getCreatedAt();
+        this.createdBy = login(pr.getUser());
+        this.closedAt = pr.getClosedAt();
+        this.closedBy = login(pr.getClosedBy());
+        this.mergedAt = pr.getMergedAt();
+        this.mergedBy = login(pr.getMergedBy());
+        this.commitCount = pr.getCommits();
+        this.commentCount = pr.getCommentsCount();
+        this.deletions = pr.getDeletions();
+        this.mergeCommitSha = pr.getMergeCommitSha();
+        this.mergeableState = pr.getMergeableState();
+        this.maintainerCanModify = pr.canMaintainerModify();
+        this.additions = pr.getAdditions();
+        this.changedFiles = pr.getChangedFiles();
+        this.mergeable = Boolean.TRUE.equals(pr.getMergeable());
+        this.merged = pr.isMerged();
+        this.assignees = new ArrayList<>(pr.getAssignees().stream().map(GHUser::getLogin).collect(toList()));
     }
 
+    private interface Action<T> {
+        T run(GitHubConnection connection) throws IOException;
+    }
+
+    private <T> T call(final Action<T> action) {
+        try (GitHubConnection connection = connect()) {
+            return action.run(connection);
+        } catch (final IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Runs a change, then refreshes the snapshot. */
+    private void change(final Action<?> action) {
+        call(connection -> {
+            action.run(connection);
+            snapshot(fetch(connection));
+            return null;
+        });
+    }
+
+    private void editPullRequest(final String field, final Object value) {
+        change(connection -> connection.rest().patch(pullPath(connection),
+                Collections.singletonMap(field, value), GitHubRest.ACCEPT_JSON));
+    }
 
     @Whitelisted
     public long getId() {
-        return pullRequest.getId();
+        return id;
     }
 
     @Whitelisted
     public int getNumber() {
-        return pullRequest.getNumber();
+        return pullRequestNumber;
     }
 
     @Whitelisted
     public String getDiffUrl() {
-        return pullRequest.getDiffUrl();
+        return diffUrl;
     }
 
     @Whitelisted
     public String getUrl() {
-        return pullRequest.getHtmlUrl();
+        return url;
     }
 
     @Whitelisted
     public String getPatchUrl() {
-        return pullRequest.getPatchUrl();
+        return patchUrl;
     }
 
     @Whitelisted
     public String getState() {
-        return pullRequest.getState();
+        return state;
     }
 
     @Whitelisted
     public String getIssueUrl() {
-        return pullRequest.getIssueUrl();
+        return issueUrl;
     }
 
     @Whitelisted
     public String getTitle() {
-        return pullRequest.getTitle();
+        return title;
     }
 
     @Whitelisted
     public String getBody() {
-        return pullRequest.getBody();
+        return body;
     }
 
     @Whitelisted
     public boolean isLocked() {
-        return pullRequest.isLocked();
+        return locked;
     }
 
     @Whitelisted
     public boolean isDraft() {
-        return pullRequest.isDraft();
+        return draft;
     }
 
     @Whitelisted
     public MilestoneGroovyObject getMilestone() {
-        return Optional.ofNullable(pullRequest.getMilestone())
-                .map(Milestone::getNumber)
-                .map(m -> getMilestoneService().getMilestone(base, m))
-                .map(milestone -> new MilestoneGroovyObject(jobId, milestone))
-                .orElse(null);
+        return milestone;
     }
 
     @Whitelisted
     public String getHead() {
-        return pullRequest.getHead().getSha();
+        return headSha;
     }
 
     @Whitelisted
     public String getHeadRef() {
-        return pullRequest.getHead().getRef();
+        return headRef;
     }
 
     @Whitelisted
     public String getBaseSha() {
-        return pullRequest.getBase().getSha();
+        return baseSha;
     }
 
     @Whitelisted
     public String getBase() {
-        return pullRequest.getBase().getRef();
+        return baseRef;
     }
 
     @Whitelisted
     public Date getUpdatedAt() {
-        return pullRequest.getUpdatedAt();
+        return copy(updatedAt);
     }
 
     @Whitelisted
     public Date getCreatedAt() {
-        return pullRequest.getCreatedAt();
+        return copy(createdAt);
     }
 
     @Whitelisted
     public String getCreatedBy() {
-        return GitHubHelper.userToLogin(pullRequest.getUser());
+        return createdBy;
     }
 
+    /** The egit version returned the creation date here. */
     @Whitelisted
     public Date getClosedAt() {
-        return pullRequest.getCreatedAt();
+        return copy(closedAt);
     }
 
+    /** Always null: GitHub's pull request API has no closed_by (it never did). */
     @Whitelisted
     public String getClosedBy() {
-        return GitHubHelper.userToLogin(pullRequest.getClosedBy());
+        return closedBy;
     }
 
     @Whitelisted
     public Date getMergedAt() {
-        return pullRequest.getMergedAt();
+        return copy(mergedAt);
     }
 
     @Whitelisted
     public String getMergedBy() {
-        return GitHubHelper.userToLogin(pullRequest.getMergedBy());
+        return mergedBy;
     }
 
     @Whitelisted
     public int getCommitCount() {
-        return pullRequest.getCommits();
+        return commitCount;
     }
 
     @Whitelisted
     public int getCommentCount() {
-        return pullRequest.getComments();
+        return commentCount;
     }
 
     @Whitelisted
     public int getDeletions() {
-        return pullRequest.getDeletions();
+        return deletions;
     }
 
     @Whitelisted
     public String getMergeCommitSha() {
-        return pullRequest.getMergeCommitSha();
+        return mergeCommitSha;
     }
 
     @Whitelisted
     public String getMergeableState() {
-        return pullRequest.getMergeableState();
+        return mergeableState;
     }
 
     @Whitelisted
     public boolean isMaintainerCanModify() {
-        return pullRequest.isMaintainerCanModify();
+        return maintainerCanModify;
     }
 
     @Whitelisted
     public int getAdditions() {
-        return pullRequest.getAdditions();
+        return additions;
     }
 
     @Whitelisted
     public int getChangedFiles() {
-        return pullRequest.getChangedFiles();
+        return changedFiles;
     }
 
     @Whitelisted
     public boolean isMergeable() {
-        return pullRequest.isMergeable();
+        return mergeable;
     }
 
     @Whitelisted
     public boolean isMerged() {
-        return pullRequest.isMerged();
+        return merged;
     }
 
     @Whitelisted
     public Iterable<String> getRequestedReviewers() {
-        Stream<String> stream = StreamSupport
-                .stream(getPullRequestService().pageRequestedReviewers(base, pullRequest.getNumber())
-                        .spliterator(), false)
-                .flatMap(Collection::stream)
-                .map(User::getLogin);
-
-        return stream::iterator;
+        return call(connection -> fetch(connection).getRequestedReviewers()
+                .stream()
+                .map(GHUser::getLogin)
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<String> getRequestedTeamReviewers() {
-        Stream<String> stream = StreamSupport
-                .stream(getPullRequestService().pageRequestedTeamReviewers(base, pullRequest.getNumber())
-                        .spliterator(), false)
-                .flatMap(Collection::stream)
-                .map(Team::getName);
-
-        return stream::iterator;
+        return call(connection -> fetch(connection).getRequestedTeams()
+                .stream()
+                .map(GHTeam::getName)
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<ReviewGroovyObject> getReviews() {
-        Stream<ReviewGroovyObject> stream = StreamSupport
-            .stream(getPullRequestService().pageReviews(base, pullRequest.getNumber())
-                    .spliterator(), false)
-            .flatMap(Collection::stream)
-            .map(ReviewGroovyObject::new);
-
-        return stream::iterator;
+        return call(connection -> fetch(connection).listReviews().toList()
+                .stream()
+                .map(ReviewGroovyObject::new)
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<CommitStatusGroovyObject> getStatuses() {
-        try {
-            return getCommitService().getStatuses(base, pullRequest.getHead().getSha())
-                    .stream()
-                    .map(CommitStatusGroovyObject::new)
-                    .collect(toList());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> connection.repository().listCommitStatuses(headSha).toList()
+                .stream()
+                .map(CommitStatusGroovyObject::new)
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<String> getLabels() {
-        Stream<String> stream = StreamSupport
-                .stream(getIssueService().getLabels(base, pullRequest.getNumber())
-                        .spliterator(), false)
-                .flatMap(Collection::stream)
-                .map(Label::getName);
-
-        return stream::iterator;
+        return call(connection -> connection.repository().getIssue(pullRequestNumber).getLabels()
+                .stream()
+                .map(GHLabel::getName)
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<String> getAssignees() {
-        return pullRequest.getAssignees()
-                .stream()
-                .map(User::getLogin)
-                .collect(toList());
+        return new ArrayList<>(assignees);
     }
 
     @Whitelisted
     public Iterable<CommitGroovyObject> getCommits() {
-        try {
-            Stream<CommitGroovyObject> steam = getPullRequestService()
-                    .getCommits(base, pullRequestNumber)
-                    .stream()
-                    .map(c -> new CommitGroovyObject(jobId, c, getCommitService(), base));
-
-            return steam::iterator;
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> connection.rest().getAll(pullPath(connection) + "/commits", GitHubRest.ACCEPT_JSON)
+                .stream()
+                .map(c -> new CommitGroovyObject(jobId, c, credentials))
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<IssueCommentGroovyObject> getComments() {
-        try {
-            Stream<IssueCommentGroovyObject> stream = getIssueService()
-                    .getComments(base, pullRequestNumber)
-                    .stream()
-                    .map(c -> new IssueCommentGroovyObject(jobId, c, base, getIssueService()));
-
-            return stream::iterator;
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> connection.rest()
+                .getAll(issuePath(connection) + "/comments", GitHubRest.ACCEPT_FULL_JSON)
+                .stream()
+                .map(c -> new IssueCommentGroovyObject(jobId, c, credentials))
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<ReviewCommentGroovyObject> getReviewComments() {
-        Stream<ReviewCommentGroovyObject> stream = StreamSupport
-                .stream(getPullRequestService().pageComments2(base,
-                        pullRequestNumber).spliterator(), false)
-                .flatMap(Collection::stream)
-                .map(c -> new ReviewCommentGroovyObject(jobId, base, c, getCommitService()));
-        return stream::iterator;
+        return call(connection -> connection.rest().getAll(pullPath(connection) + "/comments", GitHubRest.ACCEPT_JSON)
+                .stream()
+                .map(c -> new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.PULL_REQUEST, c,
+                        credentials))
+                .collect(toList()));
     }
 
     @Whitelisted
     public Iterable<CommitFileGroovyObject> getFiles() {
-        try {
-            return getPullRequestService().getFiles(base, pullRequestNumber)
-                    .stream()
-                    .map(CommitFileGroovyObject::new)
-                    .collect(toList());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> fetch(connection).listFiles().toList()
+                .stream()
+                .map(CommitFileGroovyObject::new)
+                .collect(toList()));
     }
 
     @Whitelisted
     public void setMilestone(final int milestoneNumber) {
-        pullRequest.setMilestone(
-                getIssueService().setMilestone(base, pullRequest.getNumber(), milestoneNumber)
-                        .getMilestone());
+        setMilestoneNumber(milestoneNumber);
     }
 
     @Whitelisted
     public void setMilestone(final MilestoneGroovyObject milestone) {
-        if (milestone == null) {
-            // call setMilestone because the caller might not have the right permissions to remove
-            // the milestone and it'll return the current milestone.
-            pullRequest.setMilestone(
-                    getIssueService().setMilestone(base, pullRequest.getNumber(), null)
-                        .getMilestone());
-        } else {
-            setMilestone(milestone.getNumber());
-        }
+        setMilestoneNumber(milestone == null ? null : milestone.getNumber());
+    }
+
+    private void setMilestoneNumber(@CheckForNull final Integer milestoneNumber) {
+        // hub4j needs a GHMilestone (another call) and the REST API takes the number
+        change(connection -> connection.rest().patch(issuePath(connection),
+                Collections.singletonMap("milestone", milestoneNumber), GitHubRest.ACCEPT_JSON));
     }
 
     @Whitelisted
     public void setLocked(final boolean locked) {
-        try {
+        change(connection -> {
+            GHPullRequest pr = fetch(connection);
             if (locked) {
-                getIssueService().lockIssue(base, pullRequest.getNumber());
+                pr.lock();
             } else {
-                getIssueService().unlockIssue(base, pullRequest.getNumber());
+                pr.unlock();
             }
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+            return null;
+        });
     }
 
     @Whitelisted
     public void setTitle(final String title) {
         Objects.requireNonNull(title, "title cannot be null");
-
-        ExtendedPullRequest edit = new ExtendedPullRequest();
-        edit.setNumber(pullRequest.getNumber());
-        edit.setTitle(title);
-        pullRequest = getPullRequestService().editPullRequest(base, edit);
+        change(connection -> {
+            fetch(connection).setTitle(title);
+            return null;
+        });
     }
 
     @Whitelisted
     public void setBody(final String body) {
         Objects.requireNonNull(body, "body cannot be null");
-
-        ExtendedPullRequest edit = new ExtendedPullRequest();
-        edit.setNumber(pullRequest.getNumber());
-        edit.setBody(body);
-        pullRequest = getPullRequestService().editPullRequest(base, edit);
+        change(connection -> {
+            fetch(connection).setBody(body);
+            return null;
+        });
     }
 
     @Whitelisted
     public void setState(final String state) {
         Objects.requireNonNull(state, "state cannot be null");
-
-        ExtendedPullRequest edit = new ExtendedPullRequest();
-        edit.setNumber(pullRequest.getNumber());
-        edit.setState(state);
-        pullRequest = getPullRequestService().editPullRequest(base, edit);
+        GHIssueState target;
+        try {
+            target = GHIssueState.valueOf(state.toUpperCase(Locale.ROOT));
+        } catch (final IllegalArgumentException e) {
+            throw new IllegalArgumentException("state must be open or closed; was " + state, e);
+        }
+        change(connection -> {
+            GHPullRequest pr = fetch(connection);
+            if (target == GHIssueState.CLOSED) {
+                pr.close();
+            } else if (target == GHIssueState.OPEN) {
+                pr.reopen();
+            } else {
+                throw new IllegalArgumentException("state must be open or closed; was " + state);
+            }
+            return null;
+        });
     }
 
     @Whitelisted
     public void setBase(final String newBase) {
         Objects.requireNonNull(newBase, "base cannot be null");
-
-        ExtendedPullRequest edit = new ExtendedPullRequest();
-        edit.setNumber(pullRequest.getNumber());
-        edit.setBase(new PullRequestMarker().setRef(newBase));
-        pullRequest = getPullRequestService().editPullRequest(base, edit);
+        change(connection -> fetch(connection).setBaseBranch(newBase));
     }
 
+    /** hub4j can only set maintainer_can_modify when creating a pull request. */
     @Whitelisted
     public void setMaintainerCanModify(final boolean value) {
-        ExtendedPullRequest edit = new ExtendedPullRequest();
-        edit.setNumber(pullRequest.getNumber());
-        edit.setMaintainerCanModify(value);
-        pullRequest = getPullRequestService().editPullRequest(base, edit);
+        editPullRequest("maintainer_can_modify", value);
     }
 
     @Whitelisted
     public void setLabels(final List<String> labels) {
-        try {
-            getIssueService().setLabels(base, pullRequest.getNumber(),
-                    Optional.ofNullable(labels).orElseGet(Collections::emptyList));
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
+        List<String> names = Optional.ofNullable(labels).orElseGet(Collections::emptyList);
+        call(connection -> {
+            fetch(connection).setLabels(names.toArray(new String[0]));
+            return null;
+        });
+    }
+
+    /** Review requests go through the REST API: hub4j needs a GHUser or GHTeam per name and can't remove one. */
+    private void reviewRequests(final String method,
+                                @CheckForNull final List<String> reviewers,
+                                @CheckForNull final List<String> teamReviewers) {
+        Map<String, Object> params = new HashMap<>();
+        if (reviewers != null) {
+            params.put("reviewers", reviewers);
         }
+        if (teamReviewers != null) {
+            params.put("team_reviewers", teamReviewers);
+        }
+        call(connection -> connection.rest().send(method, pullPath(connection) + "/requested_reviewers", params,
+                GitHubRest.ACCEPT_JSON));
     }
 
     @Whitelisted
@@ -513,11 +562,7 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
     @Whitelisted
     public void createReviewRequests(final List<String> reviewers) {
         Objects.requireNonNull(reviewers, "reviewers cannot be null");
-        try {
-            getPullRequestService().createReviewRequests(base, pullRequest.getNumber(), reviewers, null);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        reviewRequests("POST", reviewers, null);
     }
 
     @Whitelisted
@@ -529,13 +574,8 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
     @Whitelisted
     public void deleteReviewRequests(final List<String> reviewers) {
         Objects.requireNonNull(reviewers, "reviewers cannot be null");
-        try {
-            getPullRequestService().deleteReviewRequests(base, pullRequest.getNumber(), reviewers, null);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        reviewRequests("DELETE", reviewers, null);
     }
-
 
     @Whitelisted
     public void createTeamReviewRequest(final String team) {
@@ -546,11 +586,7 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
     @Whitelisted
     public void createTeamReviewRequests(final List<String> teams) {
         Objects.requireNonNull(teams, "teams cannot be null");
-        try {
-            getPullRequestService().createReviewRequests(base, pullRequest.getNumber(), null, teams);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        reviewRequests("POST", null, teams);
     }
 
     @Whitelisted
@@ -562,11 +598,7 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
     @Whitelisted
     public void deleteTeamReviewRequests(final List<String> teams) {
         Objects.requireNonNull(teams, "teams cannot be null");
-        try {
-            getPullRequestService().deleteReviewRequests(base, pullRequest.getNumber(), null, teams);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        reviewRequests("DELETE", null, teams);
     }
 
     @Whitelisted
@@ -577,51 +609,38 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
     @Whitelisted
     public void addLabels(final List<String> labels) {
         Objects.requireNonNull(labels, "labels is a required argument");
-        try {
-            getIssueService().addLabels(base, pullRequest.getNumber(), labels);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        call(connection -> fetch(connection).addLabels(labels.toArray(new String[0])));
     }
 
     @Whitelisted
     public void removeLabel(final String label) {
         Objects.requireNonNull(label, "label is a required argument");
-        try {
-            getIssueService().removeLabel(base, pullRequest.getNumber(), label);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        call(connection -> fetch(connection).removeLabel(label));
+    }
+
+    /** Assignees go through the REST API: hub4j needs a GHUser (another call) per login. */
+    private void assignees(final String method, final String path, final List<String> assignees) {
+        change(connection -> connection.rest().send(method, issuePath(connection) + path,
+                Collections.singletonMap("assignees", assignees), GitHubRest.ACCEPT_JSON));
     }
 
     @Whitelisted
     public void addAssignees(final List<String> assignees) {
         Objects.requireNonNull(assignees, "assignees is a required argument");
-        try {
-            getIssueService().addAssignees(base, pullRequest.getNumber(), assignees);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        assignees("POST", "/assignees", assignees);
     }
 
+    /** Replaces the assignees (PATCH the issue; the egit version used a PUT that GitHub doesn't document). */
     @Whitelisted
     public void setAssignees(final List<String> assignees) {
         Objects.requireNonNull(assignees, "assignees is a required argument");
-        try {
-            getIssueService().setAssignees(base, pullRequest.getNumber(), assignees);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        assignees("PATCH", "", assignees);
     }
 
     @Whitelisted
     public void removeAssignees(final List<String> assignees) {
         Objects.requireNonNull(assignees, "assignees is a required argument");
-        try {
-            getIssueService().removeAssignees(base, pullRequest.getNumber(), assignees);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        assignees("DELETE", "/assignees", assignees);
     }
 
     @Whitelisted
@@ -641,23 +660,33 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
                params.get("body") != null ? params.get("body").toString() : null);
     }
 
+    /**
+     * @param event APPROVE, REQUEST_CHANGES or COMMENT; null leaves the review PENDING
+     */
     @Whitelisted
     public void review(final String commitId, final String event, final String body) {
         if (event != null && (event.equals("REQUEST_CHANGES") || event.equals("COMMENT"))) {
             Objects.requireNonNull(body, "body is a required argument when event equals REQUEST_CHANGES or COMMENT");
         }
-
-        try {
-            pullRequestService.createReview(base, pullRequestNumber, commitId, event, body);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        GHPullRequestReviewEvent reviewEvent = event == null ? null : GHPullRequestReviewEvent.valueOf(event);
+        call(connection -> {
+            GHPullRequestReviewBuilder review = fetch(connection).createReview();
+            if (commitId != null) {
+                review.commitId(commitId);
+            }
+            if (body != null) {
+                review.body(body);
+            }
+            if (reviewEvent != null) {
+                review.event(reviewEvent);
+            }
+            return review.create();
+        });
     }
 
     @Whitelisted
     public CommitStatusGroovyObject createStatus(final Map<String, Object> params) {
         Objects.requireNonNull(params.get("status"), "status is a required argument");
-
         return createStatus(params.get("status").toString(),
                             params.get("context") != null ? params.get("context").toString() : null,
                             params.get("description") != null ? params.get("description").toString() : null,
@@ -670,18 +699,8 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
                                                  final String description,
                                                  final String targetUrl) {
         Objects.requireNonNull(status, "status is a required argument");
-
-        CommitStatus commitStatus = new CommitStatus();
-        commitStatus.setState(status);
-        commitStatus.setContext(context);
-        commitStatus.setDescription(description);
-        commitStatus.setTargetUrl(targetUrl);
-        try {
-            return new CommitStatusGroovyObject(
-                    getCommitService().createStatus(base, pullRequest.getHead().getSha(), commitStatus));
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection ->
+                CommitGroovyObject.createStatus(connection, headSha, status, context, description, targetUrl));
     }
 
     @Whitelisted
@@ -692,100 +711,63 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
         Objects.requireNonNull(commitId, "commitId is a required argument");
         Objects.requireNonNull(path, "path is a required argument");
         Objects.requireNonNull(body, "body is a required argument");
-
-        ExtendedCommitComment comment = new ExtendedCommitComment();
-        comment.setCommitId(commitId);
-        comment.setPath(path);
-        comment.setLine(line);
-        comment.setBody(body);
-        try {
-            return new ReviewCommentGroovyObject(
-                    jobId,
-                    base,
-                    getPullRequestService().createComment2(base, pullRequestNumber, comment),
-                    getCommitService());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        Map<String, Object> params = new HashMap<>();
+        params.put("commit_id", commitId);
+        params.put("path", path);
+        params.put("line", line);
+        params.put("side", "RIGHT");
+        params.put("body", body);
+        return call(connection -> new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.PULL_REQUEST,
+                connection.rest().post(pullPath(connection) + "/comments", params, GitHubRest.ACCEPT_JSON),
+                credentials));
     }
 
     @Whitelisted
     public ReviewCommentGroovyObject replyToReviewComment(final long commentId, final String body) {
         Objects.requireNonNull(body, "body is a required argument");
-        try {
-            return new ReviewCommentGroovyObject(
-                    jobId,
-                    base,
-                    getPullRequestService().replyToComment2(base, pullRequestNumber, (int) commentId, body),
-                    getCommitService());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.PULL_REQUEST,
+                ReviewCommentGroovyObject.reply(connection, pullRequestNumber, commentId, body), credentials));
     }
 
     @Whitelisted
     public void deleteReviewComment(final long commentId) {
-        try {
-            getPullRequestService().deleteComment(base, commentId);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        call(connection -> {
+            ReviewCommentGroovyObject.delete(connection, ReviewCommentGroovyObject.Kind.PULL_REQUEST, commentId);
+            return null;
+        });
     }
 
     @Whitelisted
     public ReviewCommentGroovyObject editReviewComment(final long commentId, final String body) {
         Objects.requireNonNull(body, "body is a required argument");
-
-        ExtendedCommitComment comment = new ExtendedCommitComment();
-        comment.setId(commentId);
-        comment.setBody(body);
-        try {
-            return new ReviewCommentGroovyObject(jobId, base, getPullRequestService().editComment2(base, comment), getCommitService());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> new ReviewCommentGroovyObject(jobId, ReviewCommentGroovyObject.Kind.PULL_REQUEST,
+                ReviewCommentGroovyObject.edit(connection, ReviewCommentGroovyObject.Kind.PULL_REQUEST, commentId,
+                        body),
+                credentials));
     }
 
     @Whitelisted
     public IssueCommentGroovyObject comment(final String body) {
         Objects.requireNonNull(body, "body is a required argument");
-
-        try {
-            return new IssueCommentGroovyObject(
-                    jobId,
-                    getIssueService().createComment(base, pullRequestNumber, body),
-                    base,
-                    getIssueService());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> new IssueCommentGroovyObject(jobId,
+                connection.rest().post(issuePath(connection) + "/comments",
+                        Collections.singletonMap("body", body), GitHubRest.ACCEPT_FULL_JSON),
+                credentials));
     }
 
     @Whitelisted
     public IssueCommentGroovyObject editComment(final long commentId, final String body) {
         Objects.requireNonNull(body, "body is a required argument");
-
-        Comment comment = new Comment();
-        comment.setId(commentId);
-        comment.setBody(body);
-        try {
-            return new IssueCommentGroovyObject(
-                    jobId,
-                    getIssueService().editComment(base, comment),
-                    base,
-                    getIssueService());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        return call(connection -> new IssueCommentGroovyObject(jobId,
+                IssueCommentGroovyObject.edit(connection, commentId, body), credentials));
     }
 
     @Whitelisted
     public void deleteComment(final long commentId) {
-        try {
-            getIssueService().deleteComment(base, commentId);
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+        call(connection -> {
+            IssueCommentGroovyObject.delete(connection, commentId);
+            return null;
+        });
     }
 
     @Whitelisted
@@ -801,44 +783,61 @@ public class PullRequestGroovyObject extends GroovyObjectSupport implements Seri
         return merge(null, commitMessage, null, null);
     }
 
+    /**
+     * Merges through the REST API: hub4j's merge has no commit title and doesn't return the merge commit.
+     *
+     * @return the merge commit's SHA
+     */
     @Whitelisted
     public String merge(final String commitTitle,
                         final String commitMessage,
                         final String sha,
                         final String mergeMethod) {
-        try {
-            ExtendedMergeStatus status = getPullRequestService().merge(base,
-                    pullRequestNumber,
-                    commitTitle,
-                    commitMessage,
-                    sha,
-                    mergeMethod);
-            if (status.isMerged()) {
-                return status.getSha();
-            } else {
-                throw new RuntimeException(status.getMessage());
-            }
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
+        Map<String, String> params = new HashMap<>();
+        if (commitTitle != null) {
+            params.put("commit_title", commitTitle);
         }
+        if (commitMessage != null) {
+            params.put("commit_message", commitMessage);
+        }
+        if (sha != null) {
+            params.put("sha", sha);
+        }
+        if (mergeMethod != null) {
+            params.put("merge_method", mergeMethod);
+        }
+        JsonNode status = call(connection -> connection.rest().put(pullPath(connection) + "/merge", params));
+        if (status != null && status.path("merged").asBoolean(false)) {
+            return GitHubRest.text(status, "sha");
+        }
+        throw new RuntimeException(status == null ? "Pull request was not merged" : GitHubRest.text(status, "message"));
     }
 
     @Whitelisted
     public void refresh() {
-        pullRequest = getPullRequestService().getPullRequest(base, pullRequest.getNumber());
+        call(connection -> {
+            snapshot(fetch(connection));
+            return null;
+        });
     }
 
+    /**
+     * Uses these credentials instead of the job's scan credentials for the rest of this object's life (they are not
+     * persisted, so a resumed build goes back to the scan credentials).
+     */
     @Whitelisted
     public void setCredentials(final String userName, final String password) {
-        getGitHubClient().setCredentials(userName, password);
+        try {
+            this.credentials = new UsernamePasswordCredentialsImpl(CredentialsScope.GLOBAL,
+                    "pipeline-github-" + UUID.randomUUID(), null, userName, password);
+        } catch (final Exception e) {
+            throw new IllegalArgumentException("Invalid credentials: " + e.getMessage(), e);
+        }
     }
 
+    /** Deletes the head branch (in the base repository, as before). */
     @Whitelisted
-    public void deleteBranch(){
-        try {
-            getPullRequestService().deleteBranch(base,pullRequest.getBranchReference());
-        } catch (final IOException e) {
-            throw new UncheckedIOException(e);
-        }
+    public void deleteBranch() {
+        call(connection -> connection.rest().delete(connection.repoPath() + "/git/refs/heads/" + headRef, null));
     }
 }

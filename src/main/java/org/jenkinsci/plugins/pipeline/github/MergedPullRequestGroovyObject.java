@@ -2,7 +2,7 @@ package org.jenkinsci.plugins.pipeline.github;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.model.Job;
-import org.jenkinsci.plugins.pipeline.github.client.ExtendedPullRequest;
+import org.kohsuke.github.GHPullRequest;
 import org.jenkinsci.plugins.scriptsecurity.sandbox.whitelists.Whitelisted;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistIn;
 import org.jenkinsci.plugins.workflow.cps.persistence.PersistenceContext;
@@ -19,7 +19,7 @@ public class MergedPullRequestGroovyObject extends PullRequestGroovyObject imple
 
     private boolean exists = false;
 
-    MergedPullRequestGroovyObject(@NonNull final Job job, final ExtendedPullRequest pr) throws Exception {
+    MergedPullRequestGroovyObject(@NonNull final Job job, final GHPullRequest pr) throws Exception {
     	super(job, pr);
     	this.exists = pr != null;
     }
